@@ -24,6 +24,7 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
@@ -60,11 +61,14 @@ static char * LocalGroupIdUpdateCommand(int32 groupId);
 static void UpdateDistNodeBoolAttr(const char *nodeName, int32 nodePort,
 								   int attrNum, bool value);
 static List * SequenceDDLCommandsForTable(Oid relationId);
+static List * SequenceDependencyCommandList(Oid relationId);
 static char * TruncateTriggerCreateCommand(Oid relationId);
 static char * SchemaOwnerName(Oid objectId);
 static bool HasMetadataWorkers(void);
 static List * DetachPartitionCommandList(void);
 static bool SyncMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
+static char * CreateSequenceDependencyCommand(const char *relationName, Oid sequenceId,
+											  int columnIndex);
 static List * GenerateGrantOnSchemaQueriesFromAclItem(Oid schemaOid,
 													  AclItem *aclItem);
 static GrantStmt * GenerateGrantOnSchemaStmtForRights(Oid roleOid,
@@ -75,6 +79,7 @@ static char * GenerateSetRoleQuery(Oid roleOid);
 
 PG_FUNCTION_INFO_V1(start_metadata_sync_to_node);
 PG_FUNCTION_INFO_V1(stop_metadata_sync_to_node);
+PG_FUNCTION_INFO_V1(worker_record_sequence_dependency);
 
 
 /*
@@ -395,6 +400,7 @@ MetadataCreateCommands(void)
 		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
 		List *ddlCommandList = GetTableDDLEvents(relationId, includeSequenceDefaults);
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
+		List *sequenceDependencyCommandList = SequenceDependencyCommandList(relationId);
 
 		/*
 		 * Tables might have dependencies on different objects, since we create shards for
@@ -410,6 +416,8 @@ MetadataCreateCommands(void)
 												  ddlCommandList);
 		metadataSnapshotCommandList = lappend(metadataSnapshotCommandList,
 											  tableOwnerResetCommand);
+		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
+												  sequenceDependencyCommandList);
 	}
 
 	/* construct the foreign key constraints after all tables are created */
@@ -508,6 +516,10 @@ GetDistributedTableDDLEvents(Oid relationId)
 		/* command to reset the table owner */
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
 		commandList = lappend(commandList, tableOwnerResetCommand);
+
+		/* command to associate sequences with table */
+		List *sequenceDependencyCommandList = SequenceDependencyCommandList(relationId);
+		commandList = list_concat(commandList, sequenceDependencyCommandList);
 	}
 
 	/* command to insert pg_dist_partition entry */
@@ -1098,6 +1110,124 @@ SequenceDDLCommandsForTable(Oid relationId)
 	}
 
 	return sequenceDDLList;
+}
+
+
+/*
+ * SequenceDependencyCommandList generates commands to record the dependency
+ * of sequences on tables on the worker. This dependency does not exist by
+ * default since the sequences and table are created separately, but it is
+ * necessary to ensure that the sequence is dropped when the table is
+ * dropped.
+ *
+ * This function is derived from getOwnedSequences_internal.
+ */
+static List *
+SequenceDependencyCommandList(Oid relationId)
+{
+	List *sequenceCommandList = NIL;
+	char *relationName = generate_qualified_relation_name(relationId);
+	HeapTuple tup = NULL;
+	ScanKeyData key[2];
+
+	Relation pgDepend = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relationId));
+
+	SysScanDesc scan = systable_beginscan(pgDepend, DependReferenceIndexId, true,
+										  NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend dependencyRecord = (Form_pg_depend) GETSTRUCT(tup);
+
+		/*
+		 * We assume any auto or internal dependency of a sequence on a column
+		 * must be what we are looking for.  (We need the relkind test because
+		 * indexes can also have auto dependencies on columns.)
+		 */
+		if (dependencyRecord->classid == RelationRelationId &&
+			dependencyRecord->objsubid == 0 &&
+			dependencyRecord->refobjsubid != 0 &&
+			(dependencyRecord->deptype == DEPENDENCY_AUTO ||
+			 dependencyRecord->deptype == DEPENDENCY_INTERNAL) &&
+			get_rel_relkind(dependencyRecord->objid) == RELKIND_SEQUENCE)
+		{
+			Oid sequenceId = dependencyRecord->objid;
+			int columnIndex = dependencyRecord->refobjsubid;
+			char *sequenceDependencyCommand =
+				CreateSequenceDependencyCommand(relationName, sequenceId, columnIndex);
+
+			sequenceCommandList = lappend(sequenceCommandList,
+										  sequenceDependencyCommand);
+		}
+	}
+
+	systable_endscan(scan);
+
+	table_close(pgDepend, AccessShareLock);
+
+	return sequenceCommandList;
+}
+
+
+/*
+ * CreateSequenceDependencyCommand generates a query string for calling
+ * worker_record_sequence on the worker to recreate a sequence->table
+ * dependency.
+ */
+static char *
+CreateSequenceDependencyCommand(const char *relationName, Oid sequenceId,
+								int columnIndex)
+{
+	char *sequenceName = generate_qualified_relation_name(sequenceId);
+
+	StringInfo sequenceDependencyCommand = makeStringInfo();
+
+	appendStringInfo(sequenceDependencyCommand,
+					 "SELECT pg_catalog.worker_record_sequence_dependency"
+					 "(%s::regclass,%s::regclass,%d)",
+					 quote_literal_cstr(sequenceName),
+					 quote_literal_cstr(relationName),
+					 columnIndex);
+
+	return sequenceDependencyCommand->data;
+}
+
+
+/*
+ * worker_record_sequence_dependency records the fact that the sequence depends on
+ * the table in pg_depend, such that it will be automatically dropped.
+ */
+Datum
+worker_record_sequence_dependency(PG_FUNCTION_ARGS)
+{
+	Oid sequenceOid = PG_GETARG_OID(0);
+	Oid relationOid = PG_GETARG_OID(1);
+	int columnIndex = PG_GETARG_INT32(2);
+
+	ObjectAddress sequenceAddr = {
+		.classId = RelationRelationId,
+		.objectId = sequenceOid,
+		.objectSubId = 0
+	};
+	ObjectAddress relationAddr = {
+		.classId = RelationRelationId,
+		.objectId = relationOid,
+		.objectSubId = columnIndex
+	};
+
+	/* dependency from sequence to table */
+	recordDependencyOn(&sequenceAddr, &relationAddr, DEPENDENCY_AUTO);
+
+	PG_RETURN_VOID();
 }
 
 
