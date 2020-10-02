@@ -67,8 +67,8 @@ static char * SchemaOwnerName(Oid objectId);
 static bool HasMetadataWorkers(void);
 static List * DetachPartitionCommandList(void);
 static bool SyncMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
-static char * CreateSequenceDependencyCommand(const char *relationName, Oid sequenceId,
-											  int columnIndex);
+static char * CreateSequenceDependencyCommand(Oid relationId, Oid sequenceId,
+											  char *columnName);
 static List * GenerateGrantOnSchemaQueriesFromAclItem(Oid schemaOid,
 													  AclItem *aclItem);
 static GrantStmt * GenerateGrantOnSchemaStmtForRights(Oid roleOid,
@@ -1119,60 +1119,39 @@ SequenceDDLCommandsForTable(Oid relationId)
  * default since the sequences and table are created separately, but it is
  * necessary to ensure that the sequence is dropped when the table is
  * dropped.
- *
- * This function is derived from getOwnedSequences_internal.
  */
 static List *
 SequenceDependencyCommandList(Oid relationId)
 {
 	List *sequenceCommandList = NIL;
-	char *relationName = generate_qualified_relation_name(relationId);
-	HeapTuple tup = NULL;
-	ScanKeyData key[2];
+	List *columnNameList = NIL;
+	List *sequenceIdList = NIL;
 
-	Relation pgDepend = table_open(DependRelationId, AccessShareLock);
+	ExtractColumnsOwningSequences(relationId, &columnNameList, &sequenceIdList);
 
-	ScanKeyInit(&key[0],
-				Anum_pg_depend_refclassid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(RelationRelationId));
-	ScanKeyInit(&key[1],
-				Anum_pg_depend_refobjid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relationId));
+	ListCell *columnNameCell = NULL;
+	ListCell *sequenceIdCell = NULL;
 
-	SysScanDesc scan = systable_beginscan(pgDepend, DependReferenceIndexId, true,
-										  NULL, 2, key);
-
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	forboth(columnNameCell, columnNameList, sequenceIdCell, sequenceIdList)
 	{
-		Form_pg_depend dependencyRecord = (Form_pg_depend) GETSTRUCT(tup);
+		char *columnName = lfirst(columnNameCell);
+		Oid sequenceId = lfirst_oid(sequenceIdCell);
 
-		/*
-		 * We assume any auto or internal dependency of a sequence on a column
-		 * must be what we are looking for.  (We need the relkind test because
-		 * indexes can also have auto dependencies on columns.)
-		 */
-		if (dependencyRecord->classid == RelationRelationId &&
-			dependencyRecord->objsubid == 0 &&
-			dependencyRecord->refobjsubid != 0 &&
-			(dependencyRecord->deptype == DEPENDENCY_AUTO ||
-			 dependencyRecord->deptype == DEPENDENCY_INTERNAL) &&
-			get_rel_relkind(dependencyRecord->objid) == RELKIND_SEQUENCE)
+		if (!OidIsValid(sequenceId))
 		{
-			Oid sequenceId = dependencyRecord->objid;
-			int columnIndex = dependencyRecord->refobjsubid;
-			char *sequenceDependencyCommand =
-				CreateSequenceDependencyCommand(relationName, sequenceId, columnIndex);
-
-			sequenceCommandList = lappend(sequenceCommandList,
-										  sequenceDependencyCommand);
+			/*
+			 * ExtractColumnsOwningSequences returns entries for all columns,
+			 * but with 0 sequence ID unless there is default nextval(..).
+			 */
+			continue;
 		}
+
+		char *sequenceDependencyCommand =
+			CreateSequenceDependencyCommand(relationId, sequenceId, columnName);
+
+		sequenceCommandList = lappend(sequenceCommandList,
+									  sequenceDependencyCommand);
 	}
-
-	systable_endscan(scan);
-
-	table_close(pgDepend, AccessShareLock);
 
 	return sequenceCommandList;
 }
@@ -1184,19 +1163,19 @@ SequenceDependencyCommandList(Oid relationId)
  * dependency.
  */
 static char *
-CreateSequenceDependencyCommand(const char *relationName, Oid sequenceId,
-								int columnIndex)
+CreateSequenceDependencyCommand(Oid relationId, Oid sequenceId, char *columnName)
 {
+	char *relationName = generate_qualified_relation_name(relationId);
 	char *sequenceName = generate_qualified_relation_name(sequenceId);
 
 	StringInfo sequenceDependencyCommand = makeStringInfo();
 
 	appendStringInfo(sequenceDependencyCommand,
 					 "SELECT pg_catalog.worker_record_sequence_dependency"
-					 "(%s::regclass,%s::regclass,%d)",
+					 "(%s::regclass,%s::regclass,%s)",
 					 quote_literal_cstr(sequenceName),
 					 quote_literal_cstr(relationName),
-					 columnIndex);
+					 quote_literal_cstr(columnName));
 
 	return sequenceDependencyCommand->data;
 }
