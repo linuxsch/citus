@@ -757,6 +757,14 @@ master_update_node(PG_FUNCTION_ARGS)
 		if (force)
 		{
 			handle = StartLockAcquireHelperBackgroundWorker(MyProcPid, lock_cooldown);
+			if (!handle)
+			{
+				StringInfo lockCooldownStringValue = makeStringInfo();
+				appendStringInfo(lockCooldownStringValue, "\"%d\"", lock_cooldown);
+				set_config_option("lock_timeout", lockCooldownStringValue->data,
+								  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
+								  GUC_ACTION_LOCAL, true, 0, false);
+			}
 		}
 
 		placementList = AllShardPlacementsOnNodeGroup(workerNode->groupId);
